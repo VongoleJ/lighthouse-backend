@@ -1,14 +1,11 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 app = FastAPI()
 
 @app.get("/")
-def root():
-    return {"ok": True, "service": "lighthouse"}
+def root(): return {"ok": True, "service": "lighthouse"}
 
 @app.get("/healthz")
-def health():
-    return {"status": "ok"}
+def health(): return {"status": "ok"}
 
 @app.get("/ping")
-def ping(request: Request):
-    return {"status": "pong", "path": str(request.url.path)}
+def ping(request: Request): return {"status":"pong"}
