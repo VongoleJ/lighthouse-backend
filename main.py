@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# -------- Env / Config ---------
+# -------- Env / Config --------
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8080")
@@ -78,7 +78,7 @@ def line_push(user_id: str, messages):
 def load_demo_df() -> pd.DataFrame:
     p = os.path.join(os.path.dirname(__file__), "sample_data.csv")
     df = pd.read_csv(p, parse_dates=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    return df
+    return add_time_columns(df)
 
 def add_time_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -138,18 +138,21 @@ def classify_patterns(df: pd.DataFrame, typical: pd.DataFrame, k: float = 2.5):
     m["lo"] = (m["typical"] - k*m["mad"]).clip(lower=0.0)
     m["hi"] = (m["typical"] + k*m["mad"]).clip(lower=0.0)
     m["out"] = (m["kwh_15m"] < m["lo"]) | (m["kwh_15m"] > m["hi"])
+
     peak = m[m["tou_period"]=="peak"].groupby("date")["kwh_15m"].sum()
     total = m.groupby("date")["kwh_15m"].sum()
     share = (peak/total).fillna(0)
     for d,v in share.items():
         if v > 0.45:
             out.append({"date": str(d), "label":"peak_share_high", "detail": f"peak share ≈ {int(v*100)}%"})
+
     night = m[(m["hour"]>=1)&(m["hour"]<4)].groupby("date")["kwh_15m"].mean()
     night_typ = m[(m["hour"]>=1)&(m["hour"]<4)].groupby("date")[["typical","mad"]].mean()
     for d,val in night.items():
         t = night_typ.loc[d,"typical"]; mad = max(0.01, night_typ.loc[d,"mad"])
         if val > t + 2.0*mad:
             out.append({"date": str(d), "label":"overnight_load_up", "detail": f"avg night {val:.2f} > {t:.2f}"})
+
     m["above"] = m["kwh_15m"] > (m["hi"] + 0.05)
     for d, day in m.groupby("date"):
         day = day.sort_values("timestamp")
@@ -159,6 +162,7 @@ def classify_patterns(df: pd.DataFrame, typical: pd.DataFrame, k: float = 2.5):
             if streak >= 3 and not flagged:
                 out.append({"date": str(d), "label":"run_on_appliance", "detail":"≥3 consecutive slots high"})
                 flagged = True
+
     daily = m.groupby("date")["kwh_15m"].sum().reset_index()
     daily["diff"] = daily["kwh_15m"].diff().abs()
     thr = daily["kwh_15m"].median()*0.2
@@ -171,12 +175,12 @@ def classify_patterns(df: pd.DataFrame, typical: pd.DataFrame, k: float = 2.5):
 def parse_thai_date(s: str) -> Optional[datetime]:
     import re
     months_th = {"ม.ค.":1,"ก.พ.":2,"มี.ค.":3,"เม.ย.":4,"พ.ค.":5,"มิ.ย.":6,"ก.ค.":7,"ส.ค.":8,"ก.ย.":9,"ต.ค.":10,"พ.ย.":11,"ธ.ค.":12}
-    m = re.search(r"(\\d{1,2})\\s*(ม\\.ค\\.|ก\\.พ\\.|มี\\.ค\\.|เม\\.ย\\.|พ\\.ค\\.|มิ\\.ย\\.|ก\\.ค\\.|ส\\.ค\\.|ก\\.ย\\.|ต\\.ค\\.|พ\\.ย\\.|ธ\\.ค\\.)", s, re.IGNORECASE)
+    m = re.search(r"(\d{1,2})\s*(ม\.ค\.|ก\.พ\.|มี\.ค\.|เม\.ย\.|พ\.ค\.|มิ\.ย\.|ก\.ค\.|ส\.ค\.|ก\.ย\.|ต\.ค\.|พ\.ย\.|ธ\.ค\.)", s, re.IGNORECASE)
     if m:
         d = int(m.group(1)); mo = months_th[m.group(2)]
         y = datetime.now().year
         return datetime(y, mo, d)
-    m2 = re.search(r"(\\d{1,2})\\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)", s, re.IGNORECASE)
+    m2 = re.search(r"(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)", s, re.IGNORECASE)
     if m2:
         d = int(m2.group(1)); mo = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"].index(m2.group(2).lower())+1
         y = datetime.now().year
@@ -261,9 +265,8 @@ def render_chart_png(df: pd.DataFrame, m: pd.DataFrame) -> bytes:
     plt2.close(fig)
     return buf.getvalue()
 
-# -------- Webhook --------
-@app.post("/callback")
-async def callback(request: Request):
+# -------- Shared webhook handler --------
+async def handle_line_webhook(request: Request):
     raw = await request.body()
     sig = request.headers.get("x-line-signature", "")
     if not verify_line_signature(raw, sig):
@@ -281,24 +284,19 @@ async def callback(request: Request):
             threading.Thread(target=process_and_push, args=(user_id, text)).start()
     return JSONResponse({"ok": True})
 
-def add_time_columns(df: pd.DataFrame) -> pd.DataFrame  # type: ignore
-# (dummy to satisfy static analyzers)
-    return df
+# -------- Expose BOTH routes (/line/webhook and /callback) --------
+@app.post("/line/webhook")
+async def line_webhook(request: Request):
+    return await handle_line_webhook(request)
 
+@app.post("/callback")
+async def callback(request: Request):
+    return await handle_line_webhook(request)
+
+# -------- Worker --------
 def process_and_push(user_id: str, question: str):
     try:
         df = load_demo_df()
-        # build derived columns AFTER load (typo fix for above static stub)
-        df["date"] = df["timestamp"].dt.date
-        df["hour"] = df["timestamp"].dt.hour
-        df["minute"] = df["timestamp"].dt.minute
-        df["weekday"] = df["timestamp"].dt.weekday
-        df["tou_period"] = df["hour"].apply(lambda h: "peak" if TOU_PEAK_START <= h < TOU_PEAK_END else "off")
-        df["price_thb_per_kwh"] = df["tou_period"].map({"peak":TOU_PEAK_THB,"off":TOU_OFF_THB})
-        df["kwh_15m"] = df["kwh"].astype(float)
-        df["kwh_hour_est"] = df["kwh_15m"] * 4.0
-        df["cost_thb"] = df["kwh_15m"] * df["price_thb_per_kwh"]
-
         tb = compute_typical(df)
         m, patterns = classify_patterns(df, tb, k=2.5)
         con = build_duck_views(df)
