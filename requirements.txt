@@ -1,3 +1,10 @@
 fastapi
-uvicorn[standard]
-httpx
+uvicorn
+pydantic
+requests
+duckdb
+pandas
+numpy
+python-dateutil
+pytz
+matplotlib
