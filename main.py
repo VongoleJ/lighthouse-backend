@@ -9,3 +9,6 @@ def root():
 def health():
     return {"status": "ok"}
 
+@app.get("/ping")
+def ping(request: Request):
+    return {"status": "pong", "path": str(request.url.path)}
